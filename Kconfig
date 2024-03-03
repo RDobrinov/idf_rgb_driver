@@ -1,0 +1,8 @@
+menu "RGB Led task"
+
+    config RGBLED_TASK_GRADIENT
+    bool "Use gamma RGB correction"
+    default n
+    help
+        Gradient mixer use sRGB gamma correction
+endmenu
