@@ -89,19 +89,98 @@ typedef struct {
     rmt_symbol_word_t reset_code;   /*!< Reset code/reason*/
 } rgbdrv_encoder_t;
 
-static rgbdrv_task_ctrl_t *tc;
+static rgbdrv_task_ctrl_t *tc;      /*!< Running task states*/
 
-static esp_err_t rgbdrv_new_encoder(const uint32_t resolution, rmt_encoder_handle_t *_encoder);
-static esp_err_t rgbdrv_delete_encoder(rmt_encoder_t *encoder);
-static esp_err_t rgbdrv_reset_encoder(rmt_encoder_t *encoder);
-static size_t rgbdrv_rtm_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel, const void *rtm_data, size_t rtm_data_size, rmt_encode_state_t *encoder_state);
+/**
+ * @brief Inverse Srgb Companding for single RGB component
+ *
+ * @param[in] v R, G or B value
+ * @return
+ *      - New R, G or B value
+ */
+static float rgbdrv_ll_value(float v);
+
+/**
+ * @brief Srgb Companding for single RGB component
+ *
+ * @param[in] v R, G or B value
+ * @return
+ *      - New R, G or B value
+ */
+static float srgb_companding(float v);
+
+/**
+ * @brief Mix two colors loaded int internal driver mixer
+ *
+ * @return
+ *      - Mixed color V ∈ {R,G,B}
+ */
+static rgbdrv_rgb_t rgbdrv_mix_colors(void);
+
+/**
+ * @brief Send new RGB value to LED
+ *
+ * @param[in] pixel Pointer to {R,G,B} value. R,G and B ∈ [0,255]
+ */
 static void rgbdrv_set_led_color(rgbdrv_rgb_t *pixel);
 
-static float rgbdrv_ll_value(float v);
-static float srgb_companding(float v);
-static rgbdrv_rgb_t rgbdrv_mix_colors(void);
+/**
+ * @brief Reset internal driver counters
+ */
 static void rgbdrv_reset_cycles(void);
 
+/**
+ * @brief Create RMT encoder for encoding LED strip pixels into RMT symbols
+ *
+ * @param[in] resolution Clock resolution
+ * @param[out] _encoder New encoder handler
+ * @return
+ *      - ESP_OK: Create task successfully
+ *      - ESP_ERR_INVALID_ARG: Create RMT TX channel or encoder failed because of invalid argument
+ *      - ESP_ERR_NO_MEM: Out of memory
+ */
+static esp_err_t rgbdrv_new_encoder(const uint32_t resolution, rmt_encoder_handle_t *_encoder);
+
+/**
+ * @brief Delete handler
+ *
+ * @param[in] encoder Base encoder handler
+ * @return
+ *      - ESP_OK
+ * @note No error handling
+ */
+static esp_err_t rgbdrv_delete_encoder(rmt_encoder_t *encoder);
+
+/**
+ * @brief Reset handler
+ *
+ * @param[in] encoder Base cncoder handler
+ * @return
+ *      - ESP_OK
+ * @note No error handling
+ */
+static esp_err_t rgbdrv_reset_encoder(rmt_encoder_t *encoder);
+
+/**
+ * @brief Encoder handler. Encode symbols
+ *
+ * @param[in] encoder Encoder handler
+ * @param[in] channel RMT Clannel
+ * @param[in] rtm_data Data for encoding
+ * @param[in] rtm_data_size Data size
+ * @param[out] encoder_state New encoder state
+ * @return
+ *      - Numeber of encoded symbols
+ */
+static size_t rgbdrv_rtm_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel, const void *rtm_data, size_t rtm_data_size, rmt_encode_state_t *encoder_state);
+
+/**
+ * @brief Program execute task function
+ * 
+ * @param[in] pvParameters A NULL value that is passed as the paramater to the created task
+ * 
+ * @return
+*/
 static void vDriverTask(void *pvParameters);
 
 esp_err_t rgbdrv_init(gpio_num_t gpio_num) {
@@ -165,17 +244,12 @@ esp_err_t rgbdrv_set_pgm(rgbdrv_led_state_t *led_state, size_t led_pgm_size) {
         if(led_state) {
             size_t mem_size = led_pgm_size * sizeof(rgbdrv_led_state_t);
             tc->led_pgm = (rgbdrv_led_state_t *)malloc(mem_size);
-            //tc->led_pgm = (rgbdrv_led_state_t *)malloc(led_pgm_size);
             if(!tc->led_pgm) return ESP_ERR_NO_MEM;
             bool gradient_pgm = false;
             while(!gradient_pgm && (tc->pgmIndex < tc->maxIndex)) {
                 gradient_pgm = (led_state[tc->pgmIndex].gradientTime > 0);
                 tc->pgmIndex++;
             }
-            /*while( !gradient_pgm && (led_state[tc->pgmIndex].holdTime != -1)) { 
-                gradient_pgm = (led_state[tc->pgmIndex].gradientTime > 0);
-                tc->pgmIndex++;
-            }*/
             if(gradient_pgm) {
                 tc->mixer = (rgbdrv_gradient_t *)calloc(1, sizeof(rgbdrv_gradient_t));
                 if(!tc->mixer) {
@@ -192,6 +266,51 @@ esp_err_t rgbdrv_set_pgm(rgbdrv_led_state_t *led_state, size_t led_pgm_size) {
     return ESP_OK;
 }
 
+static float rgbdrv_ll_value(float v) {
+    #if (CONFIG_RGBLED_TASK_GRADIENT == 1)
+    return (v > 0.04045f) ? (pow((v + 0.055f) / 1.055f ,2.4f)) : v / 12.92f;
+    #else
+    return v;
+    #endif
+}
+
+static float srgb_companding(float v) {
+    #if (CONFIG_RGBLED_TASK_GRADIENT == 1)
+    return (v > 0.0031308f) ? pow(v, 0.416666666f) * 1.055f - 0.055f : v * 12.92f;
+    #else
+    return v;
+    #endif
+}
+
+/*
+* Mix from an to colors in task control block
+*/
+static rgbdrv_rgb_t rgbdrv_mix_colors(void) {
+    rgbdrv_rgb_t mixed_color;
+    mixed_color.r = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.r) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.r * tc->mixer->mix_value))); 
+    mixed_color.g = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.g) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.g * tc->mixer->mix_value)));
+    mixed_color.b = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.b) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.b * tc->mixer->mix_value)));
+    return mixed_color;
+}
+
+static void rgbdrv_set_led_color(rgbdrv_rgb_t *pixel) {
+    rmt_transmit(tc->rmt_driver.rmt_channel, tc->rmt_driver.rmt_encoder, pixel, sizeof(rgbdrv_rgb_t), &tc->rmt_driver.rmt_tx_config);
+    rmt_tx_wait_all_done(tc->rmt_driver.rmt_channel, portMAX_DELAY);
+}
+
+static void rgbdrv_reset_cycles(void) {
+    tc->cycle_start = 0;
+    tc->cycle_interval = 0;
+    tc->cycle_start = 0;
+    tc->cycle_interval = 0;
+    tc->gradient_run = false;
+    tc->gradient_time = 0;
+    tc->gradient_start = 0;
+    tc->current_tick = 0;
+    tc->last_tick = 0;
+}
+
+/* RMT Encoder functions */
 
 static esp_err_t rgbdrv_new_encoder(const uint32_t resolution, rmt_encoder_handle_t *_encoder) {
     esp_err_t proc_result = ESP_OK;
@@ -205,6 +324,12 @@ static esp_err_t rgbdrv_new_encoder(const uint32_t resolution, rmt_encoder_handl
 
     /*
     * WS2812B timing
+    * 
+    * High level +...............+                              +..............................+
+    *            .               .                              .                              .
+    *            .<0.4us(±150ns)>.        0.85us(±150ns)        .<--------0.8us(±150ns)------->.<0.45us(±150ns)>.
+    * Low level ~+---------------+------------------------------+------------------------------+----------------+~
+    *            |<-------------------Code 0------------------->|<--------------------Code 1------------------->|
     */
     rmt_bytes_encoder_config_t bytes_encoder_config = {
         .bit0 = { .level0 = 1, .duration0 = 0.4 * resolution / 1000000, .level1 = 0, .duration1 = 0.8 * resolution / 1000000 }, // T0H=0.4us T0L=0.85us
@@ -221,7 +346,7 @@ static esp_err_t rgbdrv_new_encoder(const uint32_t resolution, rmt_encoder_handl
         else {
             if (rgbdrv_encoder->copy_encoder) {
                 rmt_del_encoder(rgbdrv_encoder->copy_encoder);
-            } // copy encoder created???
+            }
             if (rgbdrv_encoder->bytes_encoder) {
                 rmt_del_encoder(rgbdrv_encoder->bytes_encoder);
             }
@@ -282,50 +407,6 @@ static size_t rgbdrv_rtm_encode(rmt_encoder_t *encoder, rmt_channel_handle_t cha
     return encoded_symbols;
 }
 
-static void rgbdrv_set_led_color(rgbdrv_rgb_t *pixel) {
-    rmt_transmit(tc->rmt_driver.rmt_channel, tc->rmt_driver.rmt_encoder, pixel, sizeof(rgbdrv_rgb_t), &tc->rmt_driver.rmt_tx_config);
-    rmt_tx_wait_all_done(tc->rmt_driver.rmt_channel, portMAX_DELAY);
-}
-
-static float rgbdrv_ll_value(float v) {
-    #if (CONFIG_RGBLED_TASK_GRADIENT == 1)
-    return (v > 0.04045f) ? (pow((v + 0.055f) / 1.055f ,2.4f)) : v / 12.92f;
-    #else
-    return v;
-    #endif
-}
-
-static float srgb_companding(float v) {
-    #if (CONFIG_RGBLED_TASK_GRADIENT == 1)
-    return (v > 0.0031308f) ? pow(v, 0.416666666f) * 1.055f - 0.055f : v * 12.92f;
-    #else
-    return v;
-    #endif
-}
-
-/*
-* Mix from an to colors in task control block
-*/
-static rgbdrv_rgb_t rgbdrv_mix_colors(void) {
-    rgbdrv_rgb_t mixed_color;
-    mixed_color.r = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.r) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.r * tc->mixer->mix_value))); 
-    mixed_color.g = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.g) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.g * tc->mixer->mix_value)));
-    mixed_color.b = (uint8_t)(255.0f * srgb_companding(((tc->mixer->from_color.b) * (1 - tc->mixer->mix_value)) + (tc->mixer->to_color.b * tc->mixer->mix_value)));
-    return mixed_color;
-}
-
-static void rgbdrv_reset_cycles(void) {
-    tc->cycle_start = 0;
-    tc->cycle_interval = 0;
-    tc->cycle_start = 0;
-    tc->cycle_interval = 0;
-    tc->gradient_run = false;
-    tc->gradient_time = 0;
-    tc->gradient_start = 0;
-    tc->current_tick = 0;
-    tc->last_tick = 0;
-}
-
 static void vDriverTask(void *pvParameters) {
     rgbdrv_reset_cycles();
     while(true)
@@ -352,7 +433,6 @@ static void vDriverTask(void *pvParameters) {
                 if(!tc->gradient_run){
                     if(tc->cycle_interval < (tc->current_tick - tc->cycle_start))
                     {
-                        //if(tc->led_pgm[tc->pgmIndex].holdTime == -1) tc->pgmIndex = 0;
                         tc->cycle_interval = ( tc->led_pgm[tc->pgmIndex].holdTime + tc->led_pgm[tc->pgmIndex].gradientTime ) / portTICK_PERIOD_MS;
                         tc->cycle_start = tc->current_tick;
                         if(tc->mixer) {
